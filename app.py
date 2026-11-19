@@ -33,67 +33,148 @@ STOICH_O2_BYPROD_PER_T_H2 = 7.94    # t O2-Nebenprodukt aus Elektrolyse / t H2
 KWH_PER_KG_H2 = 52.0                # MWh pro t H2 (inkl. Systemperipherie)
 
 
-@st.cache_data
-def load_pvgis_raw_df(csv_path: str) -> pd.DataFrame:
-    """Liest die Rohdaten der PVGIS-TMY-CSV (17 Kopf-/Monatszeilen) sauber ein."""
-    df = pd.read_csv(csv_path, skiprows=17)
+@st.cache_data(max_entries=8, show_spinner=False)
+def load_pvgis_irradiance(csv_path: str, clean_daytime_zeros: bool = True) -> np.ndarray:
+    """
+    Lädt nur die benötigten PVGIS-Spalten (8.760h in TMY-Monatsreihenfolge, Jan -> Dez),
+    bereinigt unplausible 0.0-Werte in den Kern-Tagesstunden (07–16h UTC) und füllt
+    komplette 0-Ertragstage stundengleich aus Nachbartagen (+/- 3 Tage) auf.
+    """
+    df = pd.read_csv(
+        csv_path,
+        skiprows=17,
+        usecols=["time(UTC)", "G(h)"],
+    ).iloc[:8760].copy()
+
     if "G(h)" not in df.columns or "time(UTC)" not in df.columns:
         raise ValueError(
             f"Erforderliche Spalten ('time(UTC)', 'G(h)') nicht in '{csv_path}' gefunden. "
             f"Vorhanden: {list(df.columns)}"
         )
 
-    df = df.iloc[:8760].copy()
-    df["dt"] = pd.to_datetime(df["time(UTC)"].astype(str).str.strip(), format="%Y%m%d:%H%M", errors="coerce")
-    df["G_h_raw"] = pd.to_numeric(df["G(h)"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    return df
+    if len(df) < 8760:
+        raise ValueError(f"Zu wenige Stundenwerte in '{csv_path}' ({len(df)} statt 8.760).")
 
-
-@st.cache_data
-def load_pvgis_tmy_pv_mw(
-    csv_path: str,
-    pv_mwp_val: float,
-    pr: float = DEFAULT_PR,
-    clean_daytime_zeros: bool = True,
-) -> np.ndarray:
-    """
-    Liefert 8.760 stündliche PV-Leistungswerte in MW in TMY-Monatsreihenfolge (Jan -> Dez).
-    Bereinigt unplausible 0.0-Werte in den Kern-Tagesstunden (07–16h UTC) und füllt
-    komplette 0-Ertragstage (z. B. 20080306) stundengleich aus Nachbartagen auf.
-    """
-    df = load_pvgis_raw_df(csv_path)
-    irradiance = df["G_h_raw"].copy()
+    dt = pd.to_datetime(df["time(UTC)"].astype(str).str.strip(), format="%Y%m%d:%H%M", errors="coerce")
+    irradiance = pd.to_numeric(df["G(h)"], errors="coerce").fillna(0.0).clip(lower=0.0)
 
     if clean_daytime_zeros:
-        hour_utc = df["dt"].dt.hour
-        day_idx = np.arange(len(df)) // 24
+        hour_utc = dt.dt.hour.to_numpy()
+        day_idx = np.arange(8760) // 24
 
         # 1. Einzelne Tages-Nullen (07–16h UTC) zunächst als NaN markieren und linear interpolieren
-        daytime_zero_mask = (hour_utc >= 7) & (hour_utc <= 16) & (irradiance <= 0.0)
+        daytime_zero_mask = (hour_utc >= 7) & (hour_utc <= 16) & (irradiance.to_numpy() <= 0.0)
         irradiance = irradiance.mask(daytime_zero_mask).interpolate(method="linear", limit_direction="both")
 
         # 2. Komplette 0-Ertragstage erkennen und aus benachbarten Tagen (+/- 3 Tage) stundengleich auffüllen
-        daily_sum = pd.Series(irradiance.fillna(0.0).to_numpy()).groupby(day_idx).transform("sum")
+        daily_sum = pd.Series(irradiance.fillna(0.0).to_numpy()).groupby(day_idx).transform("sum").to_numpy()
         full_zero_day_mask = (hour_utc >= 5) & (hour_utc <= 18) & (daily_sum <= 1e-6)
         irradiance = irradiance.mask(full_zero_day_mask)
 
-        df_tmp = pd.DataFrame({"day": day_idx, "hour": hour_utc, "val": irradiance})
-        zero_days = df_tmp.loc[df_tmp["val"].isna(), "day"].unique()
+        s_val = irradiance.to_numpy(dtype=np.float64)
+        zero_days = np.unique(day_idx[np.isnan(s_val)])
         for d in zero_days:
-            neighbor_mask = (df_tmp["day"] != d) & (df_tmp["day"].between(d - 3, d + 3))
-            hourly_fallback = df_tmp[neighbor_mask].groupby("hour")["val"].mean()
-            day_rows = df_tmp["day"] == d
-            df_tmp.loc[day_rows, "val"] = df_tmp.loc[day_rows, "val"].fillna(
-                df_tmp.loc[day_rows, "hour"].map(hourly_fallback)
-            )
+            neighbor_mask = (day_idx != d) & (np.abs(day_idx - d) <= 3)
+            for h in range(24):
+                mask_dh = (day_idx == d) & (hour_utc == h) & np.isnan(s_val)
+                if np.any(mask_dh):
+                    vals = s_val[neighbor_mask & (hour_utc == h)]
+                    vals = vals[~np.isnan(vals)]
+                    s_val[mask_dh] = float(np.mean(vals)) if len(vals) > 0 else 0.0
 
-        irradiance = df_tmp["val"].fillna(0.0)
+        irradiance = pd.Series(np.nan_to_num(s_val, nan=0.0))
 
-    irradiance_arr = np.clip(irradiance.to_numpy(dtype=float), 0.0, None)
-    if len(irradiance_arr) < 8760:
-        raise ValueError(f"Zu wenige Stundenwerte in '{csv_path}' ({len(irradiance_arr)} statt 8.760).")
+    return np.clip(irradiance.to_numpy(dtype=np.float64), 0.0, None)[:8760]
 
-    return pv_mwp_val * (irradiance_arr[:8760] / STC_IRRADIANCE_W_M2) * pr
+
+@st.cache_data(max_entries=32, show_spinner=False)
+def _simulate_arrays(
+    irradiance_arr: np.ndarray,
+    pv_mwp_val: float,
+    el_mw_val: float,
+    synth_h2_rate_t_h: float,
+    buffer_cap_t: float,
+    kwh_per_kg: float,
+    pr: float = DEFAULT_PR,
+) -> dict[str, np.ndarray]:
+    """Rechnet die 8.760 Stunden auf NumPy-Arrays ohne wiederholten DataFrame-Overhead."""
+    pv_mw = pv_mwp_val * (irradiance_arr / STC_IRRADIANCE_W_M2) * pr
+    el_mw = np.minimum(pv_mw, el_mw_val)
+    curtail_mw = np.maximum(pv_mw - el_mw_val, 0.0)
+    h2_prod_t = el_mw / kwh_per_kg
+
+    storage_t = np.zeros(8760, dtype=np.float64)
+    shortfall_h2_t = np.zeros(8760, dtype=np.float64)
+    cur_buf = buffer_cap_t * 0.6
+
+    for i in range(8760):
+        cur_buf += h2_prod_t[i] - synth_h2_rate_t_h
+        if cur_buf > buffer_cap_t:
+            cur_buf = buffer_cap_t
+        elif cur_buf < 0.0:
+            shortfall_h2_t[i] = -cur_buf
+            cur_buf = 0.0
+        storage_t[i] = cur_buf
+
+    effective_h2_used_t = np.maximum(synth_h2_rate_t_h - shortfall_h2_t, 0.0)
+    methanol_prod_t = effective_h2_used_t / STOICH_H2_PER_T_MEOH
+
+    return {
+        "pv_mw": pv_mw,
+        "el_mw": el_mw,
+        "curtail_mw": curtail_mw,
+        "h2_prod_t": h2_prod_t,
+        "h2_used_t": effective_h2_used_t,
+        "storage_t": storage_t,
+        "methanol_t": methanol_prod_t,
+        "shortfall_h": (shortfall_h2_t > 1e-6).astype(np.int8),
+    }
+
+
+@st.cache_data(max_entries=32, show_spinner=False)
+def find_required_pv_mwp_fast(
+    irradiance_arr: np.ndarray,
+    target_meoh_t: float,
+    el_mw_val: float,
+    synth_h2_rate_t_h: float,
+    buffer_cap_t: float,
+    kwh_per_kg: float,
+) -> float:
+    """Ermittelt die benötigte PV-Leistung (MWp) per Binärsuche in ~16 statt bis zu 141 Schritten."""
+    low = el_mw_val * 0.5
+    high = el_mw_val * 4.0
+
+    res_high = _simulate_arrays(irradiance_arr, high, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, kwh_per_kg)
+    if float(res_high["methanol_t"].sum()) < target_meoh_t:
+        return float(high)
+
+    for _ in range(16):
+        mid = 0.5 * (low + high)
+        res_mid = _simulate_arrays(irradiance_arr, mid, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, kwh_per_kg)
+        if float(res_mid["methanol_t"].sum()) >= target_meoh_t:
+            high = mid
+        else:
+            low = mid
+
+    return float(high)
+
+
+def build_year_df(
+    irradiance_arr: np.ndarray,
+    pv_mwp_val: float,
+    el_mw_val: float,
+    synth_h2_rate_t_h: float,
+    buffer_cap_t: float,
+    kwh_per_kg: float,
+) -> pd.DataFrame:
+    """Baut den Jahres-DataFrame (8.760 Zeilen) einmalig für die Visualisierung auf."""
+    res = _simulate_arrays(irradiance_arr, pv_mwp_val, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, kwh_per_kg)
+    hours_year = np.arange(8760, dtype=np.int16)
+    return pd.DataFrame({
+        "hour": hours_year,
+        "day": hours_year // 24,
+        **res,
+    })
 
 
 # --- SIDEBAR: PARAMETER & SCHIEBEREGLER ---
@@ -134,96 +215,28 @@ nominal_h2_rate_t_h = (target_methanol_year * STOICH_H2_PER_T_MEOH) / 8760.0
 h2_buffer_capacity_t = nominal_h2_rate_t_h * h2_buffer_hours
 
 
-# --- JAHRESSIMULATION (8.760 STUNDEN) AUF BASIS VON PVGIS ---
-@st.cache_data
-def simulate_full_year(pv_mwp_val, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, kwh_per_kg, csv_path):
-    hours_year = np.arange(8760)
-    day_of_year = hours_year // 24
-
-    pv_mw = load_pvgis_tmy_pv_mw(csv_path, pv_mwp_val, pr=DEFAULT_PR, clean_daytime_zeros=True)
-
-    el_mw = np.minimum(pv_mw, el_mw_val)
-    curtail_mw = np.maximum(pv_mw - el_mw_val, 0.0)
-    h2_prod_t = el_mw / kwh_per_kg
-
-    h2_used_t = np.full(8760, synth_h2_rate_t_h)
-
-    storage_t = np.zeros(8760)
-    cur_buf = buffer_cap_t * 0.6
-    shortfall_h2_t = np.zeros(8760)
-
-    for i in range(8760):
-        delta = h2_prod_t[i] - h2_used_t[i]
-        cur_buf += delta
-        if cur_buf > buffer_cap_t:
-            cur_buf = buffer_cap_t
-        elif cur_buf < 0.0:
-            shortfall_h2_t[i] = -cur_buf
-            cur_buf = 0.0
-        storage_t[i] = cur_buf
-
-    effective_h2_used_t = np.maximum(h2_used_t - shortfall_h2_t, 0.0)
-    methanol_prod_t = effective_h2_used_t / STOICH_H2_PER_T_MEOH
-
-    return pd.DataFrame({
-        "hour": hours_year,
-        "day": day_of_year,
-        "pv_mw": pv_mw,
-        "el_mw": el_mw,
-        "curtail_mw": curtail_mw,
-        "h2_prod_t": h2_prod_t,
-        "h2_used_t": effective_h2_used_t,
-        "storage_t": storage_t,
-        "methanol_t": methanol_prod_t,
-        "shortfall_h": (shortfall_h2_t > 1e-6).astype(int),
-    })
-
-
-@st.cache_data
-def find_required_pv_mwp(
-    target_meoh_t: float,
-    el_mw_val: float,
-    synth_h2_rate_t_h: float,
-    buffer_cap_t: float,
-    kwh_per_kg: float,
-    csv_path: str,
-) -> float:
-    """Ermittelt die benötigte PV-Leistung (MWp), um target_meoh_t/a mit PVGIS zu erreichen."""
-    candidates_mwp = np.linspace(el_mw_val * 0.5, el_mw_val * 4.0, 141)
-    best_mwp = float(candidates_mwp[-1])
-
-    for cand_mwp in candidates_mwp:
-        df_test = simulate_full_year(
-            float(cand_mwp), el_mw_val, synth_h2_rate_t_h, buffer_cap_t, kwh_per_kg, csv_path
-        )
-        if df_test["methanol_t"].sum() >= target_meoh_t:
-            best_mwp = float(cand_mwp)
-            break
-
-    return best_mwp
-
-
+# --- DATEN LADEN & SIMULATION AUSFÜHREN ---
 try:
-    df_raw_pvgis = load_pvgis_raw_df(PVGIS_CSV_PATH)
-    pv_mwp = find_required_pv_mwp(
+    irradiance_arr = load_pvgis_irradiance(PVGIS_CSV_PATH, clean_daytime_zeros=True)
+    pv_mwp = find_required_pv_mwp_fast(
+        irradiance_arr,
         target_methanol_year,
         electrolyzer_mw,
         nominal_h2_rate_t_h,
         h2_buffer_capacity_t,
         KWH_PER_KG_H2,
-        PVGIS_CSV_PATH,
     )
     pv_oversizing = pv_mwp / electrolyzer_mw
     pv_area_ha = pv_mwp * BASE_PV_AREA_HA_PER_MWP * AREA_OVERHEAD_FACTOR
     pv_area_km2 = pv_area_ha / 100.0
 
-    df_year_sim = simulate_full_year(
+    df_year_sim = build_year_df(
+        irradiance_arr,
         pv_mwp,
         electrolyzer_mw,
         nominal_h2_rate_t_h,
         h2_buffer_capacity_t,
         KWH_PER_KG_H2,
-        PVGIS_CSV_PATH,
     )
 except Exception as exc:
     st.error(f"❌ PVGIS-Daten konnten nicht geladen werden ('{PVGIS_CSV_PATH}'): {exc}")
@@ -233,9 +246,7 @@ except Exception as exc:
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Ziel-Methanolproduktion", f"{target_methanol_year:,.0f} t/a", "Feste Auslegungsgröße")
 k2.metric("Benötigte PV-Leistung", f"{pv_mwp:.1f} MWp", f"Oversizing: {pv_oversizing:.2f}x")
-k3.metric(
-    "Benötigte PV-Fläche",
-    f"{pv_area_km2:,.2f} km²",)
+k3.metric("Benötigte PV-Fläche", f"{pv_area_km2:,.2f} km²")
 k4.metric("H₂-Pufferkapazität", f"{h2_buffer_capacity_t:.2f} t H₂", f"{h2_buffer_hours} Std. Nenn-Synthese")
 
 # --- TABS FÜR TAG, JAHR UND STOFFBILANZ ---
@@ -319,9 +330,9 @@ with tab_day:
 # TAB 2: GANZES JAHR (8.760h & MONATSÜBERSICHT)
 # ==============================================================================
 with tab_year:
-    total_pv_gwh = df_year_sim["pv_mw"].sum() / 1000.0
-    total_curtail_gwh = df_year_sim["curtail_mw"].sum() / 1000.0
-    total_meoh_year = df_year_sim["methanol_t"].sum()
+    total_pv_gwh = float(df_year_sim["pv_mw"].sum()) / 1000.0
+    total_curtail_gwh = float(df_year_sim["curtail_mw"].sum()) / 1000.0
+    total_meoh_year = float(df_year_sim["methanol_t"].sum())
     total_shortfall_hours = int(df_year_sim["shortfall_h"].sum())
 
     y1, y2, y3, y4 = st.columns(4)
@@ -386,12 +397,13 @@ with tab_year:
     months = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
     month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     month_idx = np.repeat(np.arange(12), month_days)
-    df_year_sim["month"] = month_idx[df_year_sim["day"]]
+    day_months = month_idx[df_year_sim["day"].to_numpy()]
 
-    df_month = df_year_sim.groupby("month", as_index=False).agg({
-        "methanol_t": "sum",
-        "curtail_mw": lambda s: s.sum() / 1000.0,
-    })
+    df_month = (
+        df_year_sim.assign(month=day_months)
+        .groupby("month", as_index=False)
+        .agg({"methanol_t": "sum", "curtail_mw": lambda s: float(s.sum()) / 1000.0})
+    )
     df_month["Monat"] = months
 
     fig_m = go.Figure()
@@ -410,7 +422,6 @@ with tab_year:
     )
     st.plotly_chart(fig_m, use_container_width=True)
 
-   
 # ==============================================================================
 # TAB 3: STÖCHIOMETRISCHE STOFF- & ENERGIEBILANZ
 # ==============================================================================
@@ -496,3 +507,4 @@ with tab_stoich:
         "kann nach Aufbereitung oft anteilig wieder in die Wasseraufbereitung/Elektrolyse zurückgeführt werden; "
         "der abgeschiedene Sauerstoff ($\\text{O}_2$) fällt an der Küste meist als Nebenprodukt an (ggf. industriell nutzbar)."
     )
+    
