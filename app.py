@@ -1,4 +1,3 @@
-import os
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -10,19 +9,19 @@ st.set_page_config(page_title="E-Methanol Simulation Port Said", layout="wide")
 
 st.title("☀️ E-Methanol & PV-Energiekopplung: Standort Port Said")
 st.markdown(
-    "Interaktive Simulation der **Tagesdynamik (24h)**, des **vollständigen Jahresverlaufs (8.760 h)** "
-    "sowie der **stöchiometrischen Stoff- und Energiebilanz**."
+    "Interaktive Simulation auf Basis realer **PVGIS-TMY-Daten** für Port Said (31,26° N, 32,30° O): "
+    "**Tagesdynamik (24h)**, **vollständiger Jahresverlauf (8.760 h)** und **stöchiometrische Stoff- & Energiebilanz**."
 )
 
 # --- PVGIS-KONSTANTEN & LOADER ---
 STC_IRRADIANCE_W_M2 = 1000.0
 DEFAULT_PR = 0.82
-PVGIS_CSV_PATH = "pvgis_port_said.csv"  # Ggf. anpassen, z. B. "data/dein_dateiname.csv"
+PVGIS_CSV_PATH = "pvgis_port_said.csv"  # Ggf. anpassen, z. B. "data/pvgis_port_said.csv"
 
 
 @st.cache_data
 def load_pvgis_tmy_pv_mw(csv_path: str, pv_mwp_val: float, pr: float = DEFAULT_PR) -> np.ndarray:
-    """Liest eine PVGIS-TMY-CSV (mit 17 Kopf-/Monatszeilen) ein und liefert stündliche PV-Leistung in MW."""
+    """Liest eine PVGIS-TMY-CSV (17 Kopf-/Monatszeilen) ein und liefert stündliche PV-Leistung in MW."""
     df = pd.read_csv(csv_path, skiprows=17)
 
     if "G(h)" not in df.columns:
@@ -58,29 +57,18 @@ h2_buffer_hours = st.sidebar.slider(
 )
 
 st.sidebar.header("🌍 Standort & Wetter (Port Said)")
-pvgis_file_exists = os.path.exists(PVGIS_CSV_PATH)
-use_pvgis = st.sidebar.checkbox(
-    "Echte PVGIS-Daten (CSV) verwenden",
-    value=pvgis_file_exists,
-    help=f"Lädt 8.760 Stundenwerte aus '{PVGIS_CSV_PATH}'. Falls deaktiviert oder nicht vorhanden, wird das synthetische Modell genutzt."
-)
-if use_pvgis and not pvgis_file_exists:
-    st.sidebar.warning(f"Datei '{PVGIS_CSV_PATH}' nicht gefunden – nutze synthetisches Modell als Fallback.")
-
 season = st.sidebar.selectbox(
-    "Referenztag für 24h-Ansicht (Port Said, 31.26° N)",
-    options=["Sommer-Peak (Juni)", "Frühjahr / Herbst (März/Sept.)", "Winter-Tief (Dezember)"],
+    "Referenztag aus PVGIS (24h-Ansicht)",
+    options=["Sommer (Juni – Tag 166)", "Übergang (September – Tag 258)", "Winter (Dezember – Tag 349)"],
     index=0
 )
 
 # --- PHYSIKALISCHE & STÖCHIOMETRISCHE BASISDATEN ---
-# Molmassen (g/mol): CH3OH = 32.04, CO2 = 44.01, H2 = 2.016 (3 mol H2 = 6.048 g/mol), H2O = 18.015, O2 = 32.00
-# Power-to-Methanol: CO2 + 3 H2 -> CH3OH + H2O (plus Wasserbedarf für Elektrolyse: 3 H2O -> 3 H2 + 1.5 O2)
-STOICH_H2_PER_T_MEOH = 0.195        # t H2 / t CH3OH (theoretisch ~0.189, praktisch ~0.195 inkl. Purge/Verluste)
-STOICH_CO2_PER_T_MEOH = 1.420       # t CO2 / t CH3OH (theoretisch 44.01/32.04 = 1.374, praktisch ~1.42 inkl. Verluste)
-STOICH_H2O_ELEC_PER_T_H2 = 9.5      # t entmineralisiertes Wasser / t H2 (theoretisch ~8.93, praktisch ~9.5)
-STOICH_H2O_SYNTH_BYPROD = 0.562     # t Reaktionswasser als Nebenprodukt / t CH3OH (18.015/32.04)
-STOICH_O2_BYPROD_PER_T_H2 = 7.94    # t O2-Nebenprodukt aus Elektrolyse / t H2 (1.5 * 32 / 6.048)
+STOICH_H2_PER_T_MEOH = 0.195        # t H2 / t CH3OH
+STOICH_CO2_PER_T_MEOH = 1.420       # t CO2 / t CH3OH
+STOICH_H2O_ELEC_PER_T_H2 = 9.5      # t entmineralisiertes Wasser / t H2
+STOICH_H2O_SYNTH_BYPROD = 0.562     # t Reaktionswasser als Nebenprodukt / t CH3OH
+STOICH_O2_BYPROD_PER_T_H2 = 7.94    # t O2-Nebenprodukt aus Elektrolyse / t H2
 
 KWH_PER_KG_H2 = 52.0                # MWh pro t H2 (inkl. Systemperipherie)
 
@@ -89,46 +77,20 @@ nominal_h2_rate_t_h = (target_methanol_year * STOICH_H2_PER_T_MEOH) / 8760.0
 h2_buffer_capacity_t = nominal_h2_rate_t_h * h2_buffer_hours
 
 
-# --- HILFSFUNKTION: STÜNDLICHES JAHRESPROFIL (8.760 STUNDEN) FÜR PORT SAID ---
+# --- JAHRESSIMULATION (8.760 STUNDEN) AUF BASIS VON PVGIS ---
 @st.cache_data
-def simulate_full_year(pv_mwp_val, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, kwh_per_kg, use_pvgis_flag, csv_path):
+def simulate_full_year(pv_mwp_val, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, kwh_per_kg, csv_path):
     hours_year = np.arange(8760)
     day_of_year = hours_year // 24
-    hour_of_day = hours_year % 24
 
-    # Saisonale Modulation über das Jahr (Maximum um Tag 172 = Mitte Juni, Minimum um Tag 355 = Mitte Dezember)
-    seasonal_wave = np.cos(2 * np.pi * (day_of_year - 172) / 365.0)
-
-    if use_pvgis_flag and os.path.exists(csv_path):
-        pv_mw = load_pvgis_tmy_pv_mw(csv_path, pv_mwp_val, pr=DEFAULT_PR)
-    else:
-        # Synthetisches Referenzmodell (Fallback)
-        day_length = 12.0 + 2.0 * seasonal_wave
-        sunrise = 12.0 - day_length / 2.0
-        sunset = 12.0 + day_length / 2.0
-        peak_factor = 0.79 + 0.11 * seasonal_wave
-
-        rng = np.random.default_rng(42)
-        daily_weather = np.clip(rng.normal(loc=1.0, scale=0.06, size=365), 0.75, 1.08)
-        weather_hourly = daily_weather[day_of_year]
-
-        in_daylight = (hour_of_day >= sunrise) & (hour_of_day <= sunset)
-        solar_angle = np.zeros_like(hour_of_day, dtype=float)
-        solar_angle[in_daylight] = np.pi * (hour_of_day[in_daylight] - sunrise[in_daylight]) / day_length[in_daylight]
-
-        pv_mw = np.zeros_like(hour_of_day, dtype=float)
-        pv_mw[in_daylight] = (
-            pv_mwp_val * peak_factor[in_daylight] * (np.sin(solar_angle[in_daylight]) ** 1.3) * weather_hourly[in_daylight]
-        )
+    pv_mw = load_pvgis_tmy_pv_mw(csv_path, pv_mwp_val, pr=DEFAULT_PR)
 
     el_mw = np.minimum(pv_mw, el_mw_val)
     curtail_mw = np.maximum(pv_mw - el_mw_val, 0.0)
-
     h2_prod_t = el_mw / kwh_per_kg
 
-    # Synthese fährt im Winter leicht gedrosselt (z. B. 70–110% je nach Saison), um Speicher zu schonen
-    synth_load_factor = np.clip(0.92 + 0.15 * seasonal_wave, 0.70, 1.10)
-    h2_used_t = synth_h2_rate_t_h * synth_load_factor
+    # Kontinuierlicher Soll-Bedarf der Synthese über das Jahr
+    h2_used_t = np.full(8760, synth_h2_rate_t_h)
 
     storage_t = np.zeros(8760)
     cur_buf = buffer_cap_t * 0.6
@@ -147,7 +109,7 @@ def simulate_full_year(pv_mwp_val, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, k
     effective_h2_used_t = np.maximum(h2_used_t - shortfall_h2_t, 0.0)
     methanol_prod_t = effective_h2_used_t / STOICH_H2_PER_T_MEOH
 
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "hour": hours_year,
         "day": day_of_year,
         "pv_mw": pv_mw,
@@ -159,13 +121,16 @@ def simulate_full_year(pv_mwp_val, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, k
         "methanol_t": methanol_prod_t,
         "shortfall_h": (shortfall_h2_t > 1e-6).astype(int)
     })
-    return df
 
 
-df_year_sim = simulate_full_year(
-    pv_mwp, electrolyzer_mw, nominal_h2_rate_t_h, h2_buffer_capacity_t,
-    KWH_PER_KG_H2, use_pvgis, PVGIS_CSV_PATH
-)
+try:
+    df_year_sim = simulate_full_year(
+        pv_mwp, electrolyzer_mw, nominal_h2_rate_t_h, h2_buffer_capacity_t, KWH_PER_KG_H2, PVGIS_CSV_PATH
+    )
+except Exception as exc:
+    st.error(f"❌ PVGIS-Daten konnten nicht geladen werden ('{PVGIS_CSV_PATH}'): {exc}")
+    st.stop()
+
 
 # --- TABS FÜR TAG, JAHR UND STOFFBILANZ ---
 tab_day, tab_year, tab_stoich = st.tabs([
@@ -175,74 +140,42 @@ tab_day, tab_year, tab_stoich = st.tabs([
 ])
 
 # ==============================================================================
-# TAB 1: TAGESANSICHT (24h)
+# TAB 1: TAGESANSICHT (24h AUS PVGIS-JAHRESDATEN)
 # ==============================================================================
 with tab_day:
-    season_params = {
-        "Sommer-Peak (Juni)": {"peak_factor": 0.90, "sunrise": 5.0, "sunset": 19.0, "synthesis_load": 1.15},
-        "Frühjahr / Herbst (März/Sept.)": {"peak_factor": 0.85, "sunrise": 6.0, "sunset": 18.0, "synthesis_load": 1.00},
-        "Winter-Tief (Dezember)": {"peak_factor": 0.68, "sunrise": 7.0, "sunset": 17.0, "synthesis_load": 0.65}
+    day_lookup = {
+        "Sommer (Juni – Tag 166)": 165,
+        "Übergang (September – Tag 258)": 257,
+        "Winter (Dezember – Tag 349)": 348
     }
-    params = season_params[season]
-    current_synthesis_h2_demand = nominal_h2_rate_t_h * params["synthesis_load"]
+    selected_day = day_lookup[season]
+    df_day = df_year_sim[df_year_sim["day"] == selected_day].reset_index(drop=True)
 
     hours = np.arange(0, 24, 1)
-    pv_generation = np.zeros(24)
-    electrolyzer_power = np.zeros(24)
-    curtailment = np.zeros(24)
-    h2_produced = np.zeros(24)
-    h2_storage_level = np.zeros(24)
-
-    current_storage = h2_buffer_capacity_t * 0.55
-    bottleneck_hours = 0
-
-    for h in hours:
-        if params["sunrise"] <= h <= params["sunset"]:
-            day_length = params["sunset"] - params["sunrise"]
-            solar_angle = np.pi * (h - params["sunrise"]) / day_length
-            pv_generation[h] = pv_mwp * params["peak_factor"] * (np.sin(solar_angle) ** 1.3)
-        else:
-            pv_generation[h] = 0.0
-
-        if pv_generation[h] > electrolyzer_mw:
-            electrolyzer_power[h] = electrolyzer_mw
-            curtailment[h] = pv_generation[h] - electrolyzer_mw
-        else:
-            electrolyzer_power[h] = pv_generation[h]
-            curtailment[h] = 0.0
-
-        h2_produced[h] = electrolyzer_power[h] / KWH_PER_KG_H2
-        net_h2 = h2_produced[h] - current_synthesis_h2_demand
-        current_storage += net_h2
-
-        if current_storage > h2_buffer_capacity_t:
-            current_storage = h2_buffer_capacity_t
-        elif current_storage <= 0.01:
-            current_storage = 0.0
-            bottleneck_hours += 1
-
-        h2_storage_level[h] = current_storage
+    pv_generation = df_day["pv_mw"].to_numpy()
+    electrolyzer_power = df_day["el_mw"].to_numpy()
+    curtailment = df_day["curtail_mw"].to_numpy()
+    h2_produced = df_day["h2_prod_t"].to_numpy()
+    h2_storage_level = df_day["storage_t"].to_numpy()
+    bottleneck_hours = int(df_day["shortfall_h"].sum())
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Installierte PV-Leistung", f"{pv_mwp:.1f} MWp", f"Faktor {pv_oversizing}x")
     col2.metric("H₂-Nachtspeicher", f"{h2_buffer_capacity_t:.2f} t H₂", f"{h2_buffer_hours} Std. Puffer")
-    col3.metric("Abgeregelte PV-Spitze (Tag)", f"{np.sum(curtailment):.1f} MWh", "Für SCZone-Netz / Abregelung")
+    col3.metric("Abgeregelte PV-Spitze (Tag)", f"{np.sum(curtailment):.1f} MWh", "PVGIS-Tageswert")
     col4.metric(
         "Synthese-Versorgung (24h)",
         "Stabil (24/7)" if bottleneck_hours == 0 else f"Engpass ({bottleneck_hours}h)",
-        delta="OK" if bottleneck_hours == 0 else "Speicher zu klein!",
+        delta="OK" if bottleneck_hours == 0 else "Speicher leer!",
         delta_color="normal" if bottleneck_hours == 0 else "inverse"
     )
 
     if bottleneck_hours > 0:
         st.error(
-            f"⚠️ **Achtung Bottleneck:** In dieser Konfiguration läuft der H₂-Speicher nachts für **{bottleneck_hours} Stunden** leer. "
-            "Die kontinuierliche Methanolsynthese würde abreißen!"
+            f"⚠️ **Speicher-Engpass am gewählten Tag:** Der H₂-Puffer reicht an diesem PVGIS-Tag für **{bottleneck_hours} Stunden** nicht aus."
         )
     else:
-        st.success(
-            f"✅ **System stabil:** Die Methanolsynthese läuft über alle 24 Stunden kontinuierlich durch (Last: {int(params['synthesis_load']*100)}%)."
-        )
+        st.success("✅ **Stabile Versorgung:** Die H₂-Versorgung der Synthese läuft an diesem Tag ohne Engpass durch.")
 
     fig_day = make_subplots(specs=[[{"secondary_y": True}]])
     fig_day.add_trace(
@@ -267,7 +200,7 @@ with tab_day:
         secondary_y=True
     )
     fig_day.update_layout(
-        title=f"24-Stunden-Lastprofil & Speicherverlauf – {season}",
+        title=f"24-Stunden-Lastprofil & Speicherverlauf (PVGIS) – {season}",
         xaxis_title="Uhrzeit (Stunde des Tages)",
         hovermode="x unified",
         height=440,
@@ -330,7 +263,7 @@ with tab_year:
         secondary_y=True
     )
     fig_365.update_layout(
-        title="Ganzjahresverlauf (365 Tage): Tages-Energieertrag & tägliche E-Methanol-Produktion",
+        title="Ganzjahresverlauf (365 Tage, PVGIS): Tages-Energieertrag & tägliche E-Methanol-Produktion",
         xaxis_title="Monat",
         hovermode="x unified",
         height=440,
@@ -380,7 +313,7 @@ with tab_stoich:
     st.markdown(
         "Berechnungsgrundlage für die katalytische E-Methanol-Synthese ($\\text{CO}_2 + 3\\,\\text{H}_2 \\rightarrow \\text{CH}_3\\text{OH} + \\text{H}_2\\text{O}$) "
         "und PEM-Wasserelektrolyse ($3\\,\\text{H}_2\\text{O} \\rightarrow 3\\,\\text{H}_2 + 1{,}5\\,\\text{O}_2$). "
-        "Die Spalten **Tag** und **Jahr** beziehen sich auf die **simulierte Jahresproduktion** im Tab *Ganzes Jahr*."
+        "Die Spalten **Tag** und **Jahr** beziehen sich auf die **simulierte Jahresproduktion** auf Basis der PVGIS-Daten."
     )
 
     sim_meoh_year = float(df_year_sim["methanol_t"].sum())
