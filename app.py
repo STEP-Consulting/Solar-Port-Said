@@ -233,7 +233,9 @@ except Exception as exc:
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Ziel-Methanolproduktion", f"{target_methanol_year:,.0f} t/a", "Feste Auslegungsgröße")
 k2.metric("Benötigte PV-Leistung", f"{pv_mwp:.1f} MWp", f"Oversizing: {pv_oversizing:.2f}x")
-k3.metric("Benötigte PV-Fläche", f"{pv_area_ha:,.1f} ha", f"{pv_area_km2:,.2f} km² (inkl. +30 %)")
+k3.metric(
+    "Benötigte PV-Fläche",
+    f"{pv_area_km2:,.2f} km²",)
 k4.metric("H₂-Pufferkapazität", f"{h2_buffer_capacity_t:.2f} t H₂", f"{h2_buffer_hours} Std. Nenn-Synthese")
 
 # --- TABS FÜR TAG, JAHR UND STOFFBILANZ ---
