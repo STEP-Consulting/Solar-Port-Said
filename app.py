@@ -10,7 +10,7 @@ st.set_page_config(page_title="E-Methanol Simulation Port Said", layout="wide")
 st.title("☀️ E-Methanol & PV-Energiekopplung: Standort Port Said")
 st.markdown(
     "Interaktive Simulation auf Basis realer **PVGIS-TMY-Daten** für Port Said (31,26° N, 32,30° O): "
-    "Automatische Dimensionierung von **PV-Oversizing** und **PV-Fläche** aus der Ziel-Methanolproduktion, "
+    "Automatische Dimensionierung von **PV-Oversizing** und **PV-Fläche** (inkl. +30 % Zuschlag) aus der Ziel-Methanolproduktion, "
     "**24h-Ansicht**, **8.760h-Jahresverlauf** sowie **stöchiometrischer Stoff- & Energiebilanz**."
 )
 
@@ -18,7 +18,10 @@ st.markdown(
 STC_IRRADIANCE_W_M2 = 1000.0
 DEFAULT_PR = 0.82
 PVGIS_CSV_PATH = "pvgis_port_said.csv"  # Ggf. anpassen, z. B. "data/pvgis_port_said.csv"
-PV_AREA_HA_PER_MWP = 1.5  # Richtwert Freifläche inkl. Reihenabstände & Wege (ha / MWp)
+
+# Standard-PV-Basisfläche (ha / MWp) + pauschal +30 % für Gänge, Abstände, Konstellation & Begleitbauwerke
+BASE_PV_AREA_HA_PER_MWP = 0.60
+AREA_OVERHEAD_FACTOR = 1.30
 
 # --- PHYSIKALISCHE & STÖCHIOMETRISCHE BASISDATEN ---
 STOICH_H2_PER_T_MEOH = 0.195        # t H2 / t CH3OH
@@ -38,30 +41,29 @@ def load_pvgis_tmy_pv_mw(
     clean_daytime_zeros: bool = True,
 ) -> np.ndarray:
     """
-    Liest eine PVGIS-TMY-CSV (17 Kopf-/Monatszeilen) ein, bereinigt optional
-    unplausible 0.0-Werte in den Kern-Tagesstunden (07–16h UTC) und liefert
-    8.760 stündliche PV-Leistungswerte in MW.
+    Liest eine PVGIS-TMY-CSV (17 Kopf-/Monatszeilen) in ihrer TMY-Monatsreihenfolge
+    (Jan -> Dez, 8.760 h) ein, bereinigt optional unplausible 0.0-Werte in den
+    Kern-Tagesstunden (07–16h UTC) und liefert stündliche PV-Leistung in MW.
     """
     df = pd.read_csv(csv_path, skiprows=17)
 
     if "G(h)" not in df.columns:
         raise ValueError(f"Spalte 'G(h)' nicht in '{csv_path}' gefunden. Vorhanden: {list(df.columns)}")
 
-    df["dt"] = pd.to_datetime(df["time(UTC)"], format="%Y%m%d:%H%M", errors="coerce")
-    df = df.dropna(subset=["dt"]).sort_values("dt").reset_index(drop=True)
+    df = df.iloc[:8760].copy()
+    dt_series = pd.to_datetime(df["time(UTC)"], format="%Y%m%d:%H%M", errors="coerce")
 
     irradiance = pd.to_numeric(df["G(h)"], errors="coerce")
 
     if clean_daytime_zeros:
-        hour_utc = df["dt"].dt.hour
+        hour_utc = dt_series.dt.hour
         daytime_zero_mask = (hour_utc >= 7) & (hour_utc <= 16) & (irradiance.fillna(0.0) <= 0.0)
         irradiance = irradiance.mask(daytime_zero_mask)
 
         if irradiance.isna().any():
-            s_indexed = pd.Series(irradiance.to_numpy(dtype=float), index=df["dt"])
-            irradiance = pd.Series(
-                s_indexed.interpolate(method="time", limit_direction="both").fillna(0.0).to_numpy(),
-                index=df.index,
+            irradiance = (
+                irradiance.interpolate(method="linear", limit_direction="both")
+                .fillna(0.0)
             )
 
     irradiance_arr = np.clip(irradiance.fillna(0.0).to_numpy(dtype=float), 0.0, None)
@@ -69,8 +71,7 @@ def load_pvgis_tmy_pv_mw(
     if len(irradiance_arr) < 8760:
         raise ValueError(f"Zu wenige Stundenwerte in '{csv_path}' ({len(irradiance_arr)} statt 8.760).")
 
-    irradiance_8760 = irradiance_arr[:8760]
-    return pv_mwp_val * (irradiance_8760 / STC_IRRADIANCE_W_M2) * pr
+    return pv_mwp_val * (irradiance_arr[:8760] / STC_IRRADIANCE_W_M2) * pr
 
 
 # --- SIDEBAR: PARAMETER & SCHIEBEREGLER ---
@@ -98,15 +99,6 @@ h2_buffer_hours = st.sidebar.slider(
     max_value=72,
     value=16,
     step=1,
-)
-
-pv_area_ha_per_mwp = st.sidebar.slider(
-    "Flächenbedarf PV (ha / MWp)",
-    min_value=1.0,
-    max_value=2.5,
-    value=PV_AREA_HA_PER_MWP,
-    step=0.1,
-    help="Freiflächen-Richtwert inkl. Reihenabstände, Wege und Infrastruktur (1 ha = 10.000 m²).",
 )
 
 st.sidebar.header("🌍 Standort & Wetter (Port Said)")
@@ -199,7 +191,7 @@ try:
         PVGIS_CSV_PATH,
     )
     pv_oversizing = pv_mwp / electrolyzer_mw
-    pv_area_ha = pv_mwp * pv_area_ha_per_mwp
+    pv_area_ha = pv_mwp * BASE_PV_AREA_HA_PER_MWP * AREA_OVERHEAD_FACTOR
     pv_area_km2 = pv_area_ha / 100.0
 
     df_year_sim = simulate_full_year(
@@ -218,7 +210,7 @@ except Exception as exc:
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Ziel-Methanolproduktion", f"{target_methanol_year:,.0f} t/a", "Feste Auslegungsgröße")
 k2.metric("Benötigte PV-Leistung", f"{pv_mwp:.1f} MWp", f"Oversizing: {pv_oversizing:.2f}x")
-k3.metric("Benötigte PV-Fläche", f"{pv_area_ha:,.1f} ha", f"{pv_area_km2:,.2f} km²")
+k3.metric("Benötigte PV-Fläche", f"{pv_area_ha:,.1f} ha", f"{pv_area_km2:,.2f} km² (inkl. +30 %)")
 k4.metric("H₂-Pufferkapazität", f"{h2_buffer_capacity_t:.2f} t H₂", f"{h2_buffer_hours} Std. Nenn-Synthese")
 
 # --- TABS FÜR TAG, JAHR UND STOFFBILANZ ---
@@ -249,7 +241,7 @@ with tab_day:
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Ausgelegte PV-Leistung", f"{pv_mwp:.1f} MWp", f"Faktor {pv_oversizing:.2f}x")
-    col2.metric("Benötigte PV-Fläche", f"{pv_area_ha:,.1f} ha", f"{pv_area_km2:,.2f} km²")
+    col2.metric("Benötigte PV-Fläche", f"{pv_area_ha:,.1f} ha", f"{pv_area_km2:,.2f} km² (inkl. +30 %)")
     col3.metric("Abgeregelte PV-Spitze (Tag)", f"{np.sum(curtailment):.1f} MWh", "PVGIS-Tageswert")
     col4.metric(
         "Synthese-Versorgung (24h)",
@@ -478,4 +470,3 @@ with tab_stoich:
         "kann nach Aufbereitung oft anteilig wieder in die Wasseraufbereitung/Elektrolyse zurückgeführt werden; "
         "der abgeschiedene Sauerstoff ($\\text{O}_2$) fällt an der Küste meist als Nebenprodukt an (ggf. industriell nutzbar)."
     )
-    
