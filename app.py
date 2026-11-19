@@ -258,7 +258,7 @@ with tab_year:
     y3.metric("Zielerreichung", f"{(total_meoh_year / target_methanol_year) * 100:.1f} %")
     y4.metric("Speicher-Engpassstunden / Jahr", f"{total_shortfall_hours} h", "von 8.760 h/a")
 
-    # Tagesmittelwerte über alle 365 Tage
+    # Tageswerte über alle 365 Tage
     df_daily = df_year_sim.groupby("day", as_index=False).agg({
         "pv_mw": "sum",          # MWh/Tag
         "el_mw": "sum",          # MWh/Tag
@@ -267,6 +267,10 @@ with tab_year:
         "methanol_t": "sum"      # t Methanol/Tag
     })
     df_daily["day_label"] = df_daily["day"] + 1
+
+    # Jeder 2. Monat auf der 365-Tage-Achse (für jeden Monat stattdessen: [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335] und alle 12 Namen)
+    month_start_days = [1, 60, 121, 182, 244, 305]
+    month_names = ["Jan", "Mär", "Mai", "Jul", "Sep", "Nov"]
 
     fig_365 = make_subplots(specs=[[{"secondary_y": True}]])
     fig_365.add_trace(
@@ -293,9 +297,21 @@ with tab_year:
         ),
         secondary_y=True
     )
-    # Monatsmarkierungen auf der 365-Tage-Achse (1. Tag jedes Monats)
-    month_start_days = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
-    month_names = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
+    fig_365.update_layout(
+        title="Ganzjahresverlauf (365 Tage): Tages-Energieertrag & tägliche E-Methanol-Produktion",
+        xaxis_title="Monat",
+        hovermode="x unified",
+        height=440,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig_365.update_xaxes(
+        tickmode="array",
+        tickvals=month_start_days,
+        ticktext=month_names
+    )
+    fig_365.update_yaxes(title_text="Tagesenergie (MWh/Tag)", secondary_y=False)
+    fig_365.update_yaxes(title_text="Methanol-Produktion (t/Tag)", secondary_y=True)
+    st.plotly_chart(fig_365, use_container_width=True)
 
     # Monatsbalken-Chart
     months = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
