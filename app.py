@@ -293,16 +293,9 @@ with tab_year:
         ),
         secondary_y=True
     )
-    fig_365.update_layout(
-        title="Ganzjahresverlauf (365 Tage): Tages-Energieertrag & tägliche E-Methanol-Produktion",
-        xaxis_title="Tag des Jahres (1 = 1. Januar, 365 = 31. Dezember)",
-        hovermode="x unified",
-        height=440,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    fig_365.update_yaxes(title_text="Tagesenergie (MWh/Tag)", secondary_y=False)
-    fig_365.update_yaxes(title_text="Methanol-Produktion (t/Tag)", secondary_y=True)
-    st.plotly_chart(fig_365, use_container_width=True)
+    # Monatsmarkierungen auf der 365-Tage-Achse (1. Tag jedes Monats)
+    month_start_days = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+    month_names = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
 
     # Monatsbalken-Chart
     months = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"]
