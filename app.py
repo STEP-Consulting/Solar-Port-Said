@@ -138,8 +138,7 @@ tab_day, tab_year, tab_stoich = st.tabs([
     "📆 Ganzes Jahr (8.760h & Monate)",
     "🧪 Stöchiometrische Stoff- & Energiebilanz"
 ])
-df = pd.read_csv("pvgis_port_said.csv", skiprows=17)
-print(df[df["time(UTC)"].astype(str).str.startswith("20080305")][["time(UTC)", "G(h)", "T2m"]])
+
 # ==============================================================================
 # TAB 1: TAGESANSICHT (24h AUS PVGIS-JAHRESDATEN)
 # ==============================================================================
