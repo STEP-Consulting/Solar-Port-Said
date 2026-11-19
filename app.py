@@ -58,21 +58,36 @@ def load_pvgis_tmy_pv_mw(
 ) -> np.ndarray:
     """
     Liefert 8.760 stündliche PV-Leistungswerte in MW in TMY-Monatsreihenfolge (Jan -> Dez).
-    Bereinigt optional unplausible 0.0-Werte in den Kern-Tagesstunden (07–16h UTC).
+    Bereinigt unplausible 0.0-Werte in den Kern-Tagesstunden (07–16h UTC) und füllt
+    komplette 0-Ertragstage (z. B. 20080306) stundengleich aus Nachbartagen auf.
     """
     df = load_pvgis_raw_df(csv_path)
     irradiance = df["G_h_raw"].copy()
 
     if clean_daytime_zeros:
         hour_utc = df["dt"].dt.hour
-        daytime_zero_mask = (hour_utc >= 7) & (hour_utc <= 16) & (irradiance <= 0.0)
-        irradiance = irradiance.mask(daytime_zero_mask)
+        day_idx = np.arange(len(df)) // 24
 
-        if irradiance.isna().any():
-            irradiance = (
-                irradiance.interpolate(method="linear", limit_direction="both")
-                .fillna(0.0)
+        # 1. Einzelne Tages-Nullen (07–16h UTC) zunächst als NaN markieren und linear interpolieren
+        daytime_zero_mask = (hour_utc >= 7) & (hour_utc <= 16) & (irradiance <= 0.0)
+        irradiance = irradiance.mask(daytime_zero_mask).interpolate(method="linear", limit_direction="both")
+
+        # 2. Komplette 0-Ertragstage erkennen und aus benachbarten Tagen (+/- 3 Tage) stundengleich auffüllen
+        daily_sum = pd.Series(irradiance.fillna(0.0).to_numpy()).groupby(day_idx).transform("sum")
+        full_zero_day_mask = (hour_utc >= 5) & (hour_utc <= 18) & (daily_sum <= 1e-6)
+        irradiance = irradiance.mask(full_zero_day_mask)
+
+        df_tmp = pd.DataFrame({"day": day_idx, "hour": hour_utc, "val": irradiance})
+        zero_days = df_tmp.loc[df_tmp["val"].isna(), "day"].unique()
+        for d in zero_days:
+            neighbor_mask = (df_tmp["day"] != d) & (df_tmp["day"].between(d - 3, d + 3))
+            hourly_fallback = df_tmp[neighbor_mask].groupby("hour")["val"].mean()
+            day_rows = df_tmp["day"] == d
+            df_tmp.loc[day_rows, "val"] = df_tmp.loc[day_rows, "val"].fillna(
+                df_tmp.loc[day_rows, "hour"].map(hourly_fallback)
             )
+
+        irradiance = df_tmp["val"].fillna(0.0)
 
     irradiance_arr = np.clip(irradiance.to_numpy(dtype=float), 0.0, None)
     if len(irradiance_arr) < 8760:
@@ -416,7 +431,7 @@ with tab_year:
         chosen_day = st.selectbox(
             "Einzelnen Tag (0-basiert) auf Stundenniveau prüfen:",
             options=daily_check["day"].tolist(),
-            index=64,  # entspricht Tag 64 -> 5. März bei Standard-Jan->Dez
+            index=65,  # entspricht Tag 65 -> 6. März bei Standard-Jan->Dez
             format_func=lambda d: f"Tag {d} ({daily_check.loc[daily_check['day'] == d, 'date_str'].iloc[0]})",
         )
         st.dataframe(
