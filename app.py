@@ -34,6 +34,22 @@ KWH_PER_KG_H2 = 52.0                # MWh pro t H2 (inkl. Systemperipherie)
 
 
 @st.cache_data
+def load_pvgis_raw_df(csv_path: str) -> pd.DataFrame:
+    """Liest die Rohdaten der PVGIS-TMY-CSV (17 Kopf-/Monatszeilen) sauber ein."""
+    df = pd.read_csv(csv_path, skiprows=17)
+    if "G(h)" not in df.columns or "time(UTC)" not in df.columns:
+        raise ValueError(
+            f"Erforderliche Spalten ('time(UTC)', 'G(h)') nicht in '{csv_path}' gefunden. "
+            f"Vorhanden: {list(df.columns)}"
+        )
+
+    df = df.iloc[:8760].copy()
+    df["dt"] = pd.to_datetime(df["time(UTC)"].astype(str).str.strip(), format="%Y%m%d:%H%M", errors="coerce")
+    df["G_h_raw"] = pd.to_numeric(df["G(h)"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    return df
+
+
+@st.cache_data
 def load_pvgis_tmy_pv_mw(
     csv_path: str,
     pv_mwp_val: float,
@@ -41,23 +57,15 @@ def load_pvgis_tmy_pv_mw(
     clean_daytime_zeros: bool = True,
 ) -> np.ndarray:
     """
-    Liest eine PVGIS-TMY-CSV (17 Kopf-/Monatszeilen) in ihrer TMY-Monatsreihenfolge
-    (Jan -> Dez, 8.760 h) ein, bereinigt optional unplausible 0.0-Werte in den
-    Kern-Tagesstunden (07–16h UTC) und liefert stündliche PV-Leistung in MW.
+    Liefert 8.760 stündliche PV-Leistungswerte in MW in TMY-Monatsreihenfolge (Jan -> Dez).
+    Bereinigt optional unplausible 0.0-Werte in den Kern-Tagesstunden (07–16h UTC).
     """
-    df = pd.read_csv(csv_path, skiprows=17)
-
-    if "G(h)" not in df.columns:
-        raise ValueError(f"Spalte 'G(h)' nicht in '{csv_path}' gefunden. Vorhanden: {list(df.columns)}")
-
-    df = df.iloc[:8760].copy()
-    dt_series = pd.to_datetime(df["time(UTC)"], format="%Y%m%d:%H%M", errors="coerce")
-
-    irradiance = pd.to_numeric(df["G(h)"], errors="coerce")
+    df = load_pvgis_raw_df(csv_path)
+    irradiance = df["G_h_raw"].copy()
 
     if clean_daytime_zeros:
-        hour_utc = dt_series.dt.hour
-        daytime_zero_mask = (hour_utc >= 7) & (hour_utc <= 16) & (irradiance.fillna(0.0) <= 0.0)
+        hour_utc = df["dt"].dt.hour
+        daytime_zero_mask = (hour_utc >= 7) & (hour_utc <= 16) & (irradiance <= 0.0)
         irradiance = irradiance.mask(daytime_zero_mask)
 
         if irradiance.isna().any():
@@ -66,8 +74,7 @@ def load_pvgis_tmy_pv_mw(
                 .fillna(0.0)
             )
 
-    irradiance_arr = np.clip(irradiance.fillna(0.0).to_numpy(dtype=float), 0.0, None)
-
+    irradiance_arr = np.clip(irradiance.to_numpy(dtype=float), 0.0, None)
     if len(irradiance_arr) < 8760:
         raise ValueError(f"Zu wenige Stundenwerte in '{csv_path}' ({len(irradiance_arr)} statt 8.760).")
 
@@ -182,6 +189,7 @@ def find_required_pv_mwp(
 
 
 try:
+    df_raw_pvgis = load_pvgis_raw_df(PVGIS_CSV_PATH)
     pv_mwp = find_required_pv_mwp(
         target_methanol_year,
         electrolyzer_mw,
@@ -384,6 +392,38 @@ with tab_year:
         height=370,
     )
     st.plotly_chart(fig_m, use_container_width=True)
+
+    with st.expander("🔍 Diagnose: März-Tage & auffällige 0-Ertragstage in den PVGIS-Rohdaten"):
+        df_diag = df_raw_pvgis.copy()
+        df_diag["day"] = np.arange(8760) // 24
+        df_diag["pv_sim_mw"] = df_year_sim["pv_mw"].to_numpy()
+        df_diag["date_str"] = df_diag["dt"].dt.strftime("%Y-%m-%d")
+
+        daily_check = df_diag.groupby(["day", "date_str"], as_index=False).agg(
+            g_h_raw_sum=("G_h_raw", "sum"),
+            pv_sim_mwh=("pv_sim_mw", "sum"),
+        )
+        zero_days_all = daily_check[daily_check["pv_sim_mwh"] <= 1e-6]
+        march_days = daily_check[(daily_check["day"] >= 59) & (daily_check["day"] <= 89)]
+
+        st.write(f"Tage im gesamten Jahr mit `0` PV-Ertrag nach Bereinigung: **{len(zero_days_all)}**")
+        if len(zero_days_all) > 0:
+            st.dataframe(zero_days_all, use_container_width=True, hide_index=True)
+
+        st.write("Niedrigste PV-Tageserträge im März (Tage 59–89, 0-basiert):")
+        st.dataframe(march_days.nsmallest(7, "pv_sim_mwh"), use_container_width=True, hide_index=True)
+
+        chosen_day = st.selectbox(
+            "Einzelnen Tag (0-basiert) auf Stundenniveau prüfen:",
+            options=daily_check["day"].tolist(),
+            index=64,  # entspricht Tag 64 -> 5. März bei Standard-Jan->Dez
+            format_func=lambda d: f"Tag {d} ({daily_check.loc[daily_check['day'] == d, 'date_str'].iloc[0]})",
+        )
+        st.dataframe(
+            df_diag[df_diag["day"] == chosen_day][["time(UTC)", "G_h_raw", "pv_sim_mw"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 # ==============================================================================
 # TAB 3: STÖCHIOMETRISCHE STOFF- & ENERGIEBILANZ
