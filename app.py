@@ -10,58 +10,15 @@ st.set_page_config(page_title="E-Methanol Simulation Port Said", layout="wide")
 st.title("☀️ E-Methanol & PV-Energiekopplung: Standort Port Said")
 st.markdown(
     "Interaktive Simulation auf Basis realer **PVGIS-TMY-Daten** für Port Said (31,26° N, 32,30° O): "
-    "**Tagesdynamik (24h)**, **vollständiger Jahresverlauf (8.760 h)** und **stöchiometrische Stoff- & Energiebilanz**."
+    "Automatische Dimensionierung von **PV-Oversizing** und **PV-Fläche** aus der Ziel-Methanolproduktion, "
+    "**24h-Ansicht**, **8.760h-Jahresverlauf** sowie **stöchiometrischer Stoff- & Energiebilanz**."
 )
 
-# --- PVGIS-KONSTANTEN & LOADER ---
+# --- PVGIS- & FLÄCHEN-KONSTANTEN ---
 STC_IRRADIANCE_W_M2 = 1000.0
 DEFAULT_PR = 0.82
 PVGIS_CSV_PATH = "pvgis_port_said.csv"  # Ggf. anpassen, z. B. "data/pvgis_port_said.csv"
-
-
-@st.cache_data
-def load_pvgis_tmy_pv_mw(csv_path: str, pv_mwp_val: float, pr: float = DEFAULT_PR) -> np.ndarray:
-    """Liest eine PVGIS-TMY-CSV (17 Kopf-/Monatszeilen) ein und liefert stündliche PV-Leistung in MW."""
-    df = pd.read_csv(csv_path, skiprows=17)
-
-    if "G(h)" not in df.columns:
-        raise ValueError(f"Spalte 'G(h)' nicht in '{csv_path}' gefunden. Vorhanden: {list(df.columns)}")
-
-    irradiance = pd.to_numeric(df["G(h)"], errors="coerce").dropna().to_numpy(dtype=float)
-
-    if len(irradiance) < 8760:
-        raise ValueError(f"Zu wenige Stundenwerte in '{csv_path}' ({len(irradiance)} statt 8.760).")
-
-    irradiance = np.clip(irradiance[:8760], 0.0, None)
-    return pv_mwp_val * (irradiance / STC_IRRADIANCE_W_M2) * pr
-
-
-# --- SIDEBAR: PARAMETER & SCHIEBEREGLER ---
-st.sidebar.header("⚙️ Anlagenparameter")
-
-target_methanol_year = st.sidebar.number_input(
-    "Zielproduktion Methanol (t/Jahr)", min_value=1000, max_value=100000, value=9000, step=500
-)
-
-electrolyzer_mw = st.sidebar.slider(
-    "PEM-Elektrolyseur Nennleistung (MW)", min_value=5.0, max_value=60.0, value=26.0, step=1.0
-)
-
-pv_oversizing = st.sidebar.slider(
-    "PV-Oversizing-Faktor", min_value=1.0, max_value=3.5, value=1.7, step=0.1,
-    help="Verhältnis von installierter PV-Spitzenleistung (MWp) zu Elektrolyseur-Leistung (MW)."
-)
-
-h2_buffer_hours = st.sidebar.slider(
-    "H₂-Pufferkapazität (Stunden Nenn-Synthese)", min_value=4, max_value=72, value=16, step=1
-)
-
-st.sidebar.header("🌍 Standort & Wetter (Port Said)")
-season = st.sidebar.selectbox(
-    "Referenztag aus PVGIS (24h-Ansicht)",
-    options=["Sommer (Juni – Tag 166)", "Übergang (September – Tag 258)", "Winter (Dezember – Tag 349)"],
-    index=0
-)
+PV_AREA_HA_PER_MWP = 1.5  # Richtwert Freifläche inkl. Reihenabstände & Wege (ha / MWp)
 
 # --- PHYSIKALISCHE & STÖCHIOMETRISCHE BASISDATEN ---
 STOICH_H2_PER_T_MEOH = 0.195        # t H2 / t CH3OH
@@ -72,7 +29,93 @@ STOICH_O2_BYPROD_PER_T_H2 = 7.94    # t O2-Nebenprodukt aus Elektrolyse / t H2
 
 KWH_PER_KG_H2 = 52.0                # MWh pro t H2 (inkl. Systemperipherie)
 
-pv_mwp = electrolyzer_mw * pv_oversizing
+
+@st.cache_data
+def load_pvgis_tmy_pv_mw(
+    csv_path: str,
+    pv_mwp_val: float,
+    pr: float = DEFAULT_PR,
+    clean_daytime_zeros: bool = True,
+) -> np.ndarray:
+    """
+    Liest eine PVGIS-TMY-CSV (17 Kopf-/Monatszeilen) ein, bereinigt optional
+    unplausible 0.0-Werte in den Kern-Tagesstunden (07–16h UTC) und liefert
+    8.760 stündliche PV-Leistungswerte in MW.
+    """
+    df = pd.read_csv(csv_path, skiprows=17)
+
+    if "G(h)" not in df.columns:
+        raise ValueError(f"Spalte 'G(h)' nicht in '{csv_path}' gefunden. Vorhanden: {list(df.columns)}")
+
+    df["dt"] = pd.to_datetime(df["time(UTC)"], format="%Y%m%d:%H%M", errors="coerce")
+    df = df.dropna(subset=["dt"]).sort_values("dt").reset_index(drop=True)
+
+    irradiance = pd.to_numeric(df["G(h)"], errors="coerce")
+
+    if clean_daytime_zeros:
+        hour_utc = df["dt"].dt.hour
+        daytime_zero_mask = (hour_utc >= 7) & (hour_utc <= 16) & (irradiance.fillna(0.0) <= 0.0)
+        irradiance = irradiance.mask(daytime_zero_mask)
+
+        if irradiance.isna().any():
+            s_indexed = pd.Series(irradiance.to_numpy(dtype=float), index=df["dt"])
+            irradiance = pd.Series(
+                s_indexed.interpolate(method="time", limit_direction="both").fillna(0.0).to_numpy(),
+                index=df.index,
+            )
+
+    irradiance_arr = np.clip(irradiance.fillna(0.0).to_numpy(dtype=float), 0.0, None)
+
+    if len(irradiance_arr) < 8760:
+        raise ValueError(f"Zu wenige Stundenwerte in '{csv_path}' ({len(irradiance_arr)} statt 8.760).")
+
+    irradiance_8760 = irradiance_arr[:8760]
+    return pv_mwp_val * (irradiance_8760 / STC_IRRADIANCE_W_M2) * pr
+
+
+# --- SIDEBAR: PARAMETER & SCHIEBEREGLER ---
+st.sidebar.header("⚙️ Anlagenparameter")
+
+target_methanol_year = st.sidebar.number_input(
+    "Zielproduktion Methanol (t/Jahr)",
+    min_value=1000,
+    max_value=100000,
+    value=9000,
+    step=500,
+)
+
+electrolyzer_mw = st.sidebar.slider(
+    "PEM-Elektrolyseur Nennleistung (MW)",
+    min_value=5.0,
+    max_value=60.0,
+    value=26.0,
+    step=1.0,
+)
+
+h2_buffer_hours = st.sidebar.slider(
+    "H₂-Pufferkapazität (Stunden Nenn-Synthese)",
+    min_value=4,
+    max_value=72,
+    value=16,
+    step=1,
+)
+
+pv_area_ha_per_mwp = st.sidebar.slider(
+    "Flächenbedarf PV (ha / MWp)",
+    min_value=1.0,
+    max_value=2.5,
+    value=PV_AREA_HA_PER_MWP,
+    step=0.1,
+    help="Freiflächen-Richtwert inkl. Reihenabstände, Wege und Infrastruktur (1 ha = 10.000 m²).",
+)
+
+st.sidebar.header("🌍 Standort & Wetter (Port Said)")
+season = st.sidebar.selectbox(
+    "Referenztag aus PVGIS (24h-Ansicht)",
+    options=["Sommer (Juni – Tag 166)", "Übergang (September – Tag 258)", "Winter (Dezember – Tag 349)"],
+    index=0,
+)
+
 nominal_h2_rate_t_h = (target_methanol_year * STOICH_H2_PER_T_MEOH) / 8760.0
 h2_buffer_capacity_t = nominal_h2_rate_t_h * h2_buffer_hours
 
@@ -83,13 +126,12 @@ def simulate_full_year(pv_mwp_val, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, k
     hours_year = np.arange(8760)
     day_of_year = hours_year // 24
 
-    pv_mw = load_pvgis_tmy_pv_mw(csv_path, pv_mwp_val, pr=DEFAULT_PR)
+    pv_mw = load_pvgis_tmy_pv_mw(csv_path, pv_mwp_val, pr=DEFAULT_PR, clean_daytime_zeros=True)
 
     el_mw = np.minimum(pv_mw, el_mw_val)
     curtail_mw = np.maximum(pv_mw - el_mw_val, 0.0)
     h2_prod_t = el_mw / kwh_per_kg
 
-    # Kontinuierlicher Soll-Bedarf der Synthese über das Jahr
     h2_used_t = np.full(8760, synth_h2_rate_t_h)
 
     storage_t = np.zeros(8760)
@@ -119,24 +161,71 @@ def simulate_full_year(pv_mwp_val, el_mw_val, synth_h2_rate_t_h, buffer_cap_t, k
         "h2_used_t": effective_h2_used_t,
         "storage_t": storage_t,
         "methanol_t": methanol_prod_t,
-        "shortfall_h": (shortfall_h2_t > 1e-6).astype(int)
+        "shortfall_h": (shortfall_h2_t > 1e-6).astype(int),
     })
 
 
+@st.cache_data
+def find_required_pv_mwp(
+    target_meoh_t: float,
+    el_mw_val: float,
+    synth_h2_rate_t_h: float,
+    buffer_cap_t: float,
+    kwh_per_kg: float,
+    csv_path: str,
+) -> float:
+    """Ermittelt die benötigte PV-Leistung (MWp), um target_meoh_t/a mit PVGIS zu erreichen."""
+    candidates_mwp = np.linspace(el_mw_val * 0.5, el_mw_val * 4.0, 141)
+    best_mwp = float(candidates_mwp[-1])
+
+    for cand_mwp in candidates_mwp:
+        df_test = simulate_full_year(
+            float(cand_mwp), el_mw_val, synth_h2_rate_t_h, buffer_cap_t, kwh_per_kg, csv_path
+        )
+        if df_test["methanol_t"].sum() >= target_meoh_t:
+            best_mwp = float(cand_mwp)
+            break
+
+    return best_mwp
+
+
 try:
+    pv_mwp = find_required_pv_mwp(
+        target_methanol_year,
+        electrolyzer_mw,
+        nominal_h2_rate_t_h,
+        h2_buffer_capacity_t,
+        KWH_PER_KG_H2,
+        PVGIS_CSV_PATH,
+    )
+    pv_oversizing = pv_mwp / electrolyzer_mw
+    pv_area_ha = pv_mwp * pv_area_ha_per_mwp
+    pv_area_km2 = pv_area_ha / 100.0
+
     df_year_sim = simulate_full_year(
-        pv_mwp, electrolyzer_mw, nominal_h2_rate_t_h, h2_buffer_capacity_t, KWH_PER_KG_H2, PVGIS_CSV_PATH
+        pv_mwp,
+        electrolyzer_mw,
+        nominal_h2_rate_t_h,
+        h2_buffer_capacity_t,
+        KWH_PER_KG_H2,
+        PVGIS_CSV_PATH,
     )
 except Exception as exc:
     st.error(f"❌ PVGIS-Daten konnten nicht geladen werden ('{PVGIS_CSV_PATH}'): {exc}")
     st.stop()
 
+# --- AUSLEGUNGS-ÜBERSICHT (AUTOMATISCH BERECHNET) ---
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Ziel-Methanolproduktion", f"{target_methanol_year:,.0f} t/a", "Feste Auslegungsgröße")
+k2.metric("Benötigte PV-Leistung", f"{pv_mwp:.1f} MWp", f"Oversizing: {pv_oversizing:.2f}x")
+k3.metric("Benötigte PV-Fläche", f"{pv_area_ha:,.1f} ha", f"{pv_area_km2:,.2f} km²")
+k4.metric("H₂-Pufferkapazität", f"{h2_buffer_capacity_t:.2f} t H₂", f"{h2_buffer_hours} Std. Nenn-Synthese")
 
 # --- TABS FÜR TAG, JAHR UND STOFFBILANZ ---
 tab_day, tab_year, tab_stoich = st.tabs([
     "🕒 Tagesansicht (24h)",
     "📆 Ganzes Jahr (8.760h & Monate)",
-    "🧪 Stöchiometrische Stoff- & Energiebilanz"
+    "🧪 Stöchiometrische Stoff- & Energiebilanz",
 ])
 
 # ==============================================================================
@@ -146,7 +235,7 @@ with tab_day:
     day_lookup = {
         "Sommer (Juni – Tag 166)": 165,
         "Übergang (September – Tag 258)": 257,
-        "Winter (Dezember – Tag 349)": 348
+        "Winter (Dezember – Tag 349)": 348,
     }
     selected_day = day_lookup[season]
     df_day = df_year_sim[df_year_sim["day"] == selected_day].reset_index(drop=True)
@@ -155,19 +244,18 @@ with tab_day:
     pv_generation = df_day["pv_mw"].to_numpy()
     electrolyzer_power = df_day["el_mw"].to_numpy()
     curtailment = df_day["curtail_mw"].to_numpy()
-    h2_produced = df_day["h2_prod_t"].to_numpy()
     h2_storage_level = df_day["storage_t"].to_numpy()
     bottleneck_hours = int(df_day["shortfall_h"].sum())
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Installierte PV-Leistung", f"{pv_mwp:.1f} MWp", f"Faktor {pv_oversizing}x")
-    col2.metric("H₂-Nachtspeicher", f"{h2_buffer_capacity_t:.2f} t H₂", f"{h2_buffer_hours} Std. Puffer")
+    col1.metric("Ausgelegte PV-Leistung", f"{pv_mwp:.1f} MWp", f"Faktor {pv_oversizing:.2f}x")
+    col2.metric("Benötigte PV-Fläche", f"{pv_area_ha:,.1f} ha", f"{pv_area_km2:,.2f} km²")
     col3.metric("Abgeregelte PV-Spitze (Tag)", f"{np.sum(curtailment):.1f} MWh", "PVGIS-Tageswert")
     col4.metric(
         "Synthese-Versorgung (24h)",
         "Stabil (24/7)" if bottleneck_hours == 0 else f"Engpass ({bottleneck_hours}h)",
         delta="OK" if bottleneck_hours == 0 else "Speicher leer!",
-        delta_color="normal" if bottleneck_hours == 0 else "inverse"
+        delta_color="normal" if bottleneck_hours == 0 else "inverse",
     )
 
     if bottleneck_hours > 0:
@@ -183,28 +271,28 @@ with tab_day:
             x=hours, y=pv_generation, name="PV-Erzeugung (MW)",
             line=dict(color="#FDB813", width=3), fill="tozeroy", fillcolor="rgba(253, 184, 19, 0.2)"
         ),
-        secondary_y=False
+        secondary_y=False,
     )
     fig_day.add_trace(
         go.Scatter(
             x=hours, y=electrolyzer_power, name="Elektrolyseur-Last (MW)",
             line=dict(color="#00A8E8", width=3)
         ),
-        secondary_y=False
+        secondary_y=False,
     )
     fig_day.add_trace(
         go.Scatter(
             x=hours, y=h2_storage_level, name="H₂-Speicherfüllstand (t)",
             line=dict(color="#2ECC71", width=3, dash="dot")
         ),
-        secondary_y=True
+        secondary_y=True,
     )
     fig_day.update_layout(
         title=f"24-Stunden-Lastprofil & Speicherverlauf (PVGIS) – {season}",
         xaxis_title="Uhrzeit (Stunde des Tages)",
         hovermode="x unified",
         height=440,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig_day.update_yaxes(title_text="Elektrische Leistung (MW)", range=[0, max(pv_mwp * 1.1, 1.0)], secondary_y=False)
     fig_day.update_yaxes(title_text="H₂-Speicherfüllstand (Tonnen)", range=[0, max(h2_buffer_capacity_t * 1.15, 0.5)], secondary_y=True)
@@ -230,7 +318,7 @@ with tab_year:
         "el_mw": "sum",
         "curtail_mw": "sum",
         "storage_t": "mean",
-        "methanol_t": "sum"
+        "methanol_t": "sum",
     })
     df_daily["day_label"] = df_daily["day"] + 1
 
@@ -244,7 +332,7 @@ with tab_year:
             name="Täglicher PV-Ertrag (MWh/Tag)",
             line=dict(color="#FDB813", width=2), fill="tozeroy", fillcolor="rgba(253, 184, 19, 0.18)"
         ),
-        secondary_y=False
+        secondary_y=False,
     )
     fig_365.add_trace(
         go.Scatter(
@@ -252,7 +340,7 @@ with tab_year:
             name="Genutzter Elektrolyseur-Strom (MWh/Tag)",
             line=dict(color="#00A8E8", width=2)
         ),
-        secondary_y=False
+        secondary_y=False,
     )
     fig_365.add_trace(
         go.Scatter(
@@ -260,19 +348,19 @@ with tab_year:
             name="Tägliche Methanol-Produktion (t/Tag)",
             line=dict(color="#2ECC71", width=2.5)
         ),
-        secondary_y=True
+        secondary_y=True,
     )
     fig_365.update_layout(
         title="Ganzjahresverlauf (365 Tage, PVGIS): Tages-Energieertrag & tägliche E-Methanol-Produktion",
         xaxis_title="Monat",
         hovermode="x unified",
         height=440,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     fig_365.update_xaxes(
         tickmode="array",
         tickvals=month_start_days,
-        ticktext=month_names
+        ticktext=month_names,
     )
     fig_365.update_yaxes(title_text="Tagesenergie (MWh/Tag)", secondary_y=False)
     fig_365.update_yaxes(title_text="Methanol-Produktion (t/Tag)", secondary_y=True)
@@ -285,7 +373,7 @@ with tab_year:
 
     df_month = df_year_sim.groupby("month", as_index=False).agg({
         "methanol_t": "sum",
-        "curtail_mw": lambda s: s.sum() / 1000.0
+        "curtail_mw": lambda s: s.sum() / 1000.0,
     })
     df_month["Monat"] = months
 
@@ -301,7 +389,7 @@ with tab_year:
     fig_m.update_layout(
         title="Monatliche E-Methanol-Produktion über das gesamte Jahr",
         yaxis_title="E-Methanol (Tonnen)",
-        height=370
+        height=370,
     )
     st.plotly_chart(fig_m, use_container_width=True)
 
@@ -336,50 +424,50 @@ with tab_stoich:
             "Rolle im Prozess": "Hauptprodukt",
             "Je t Methanol": "1,000 t",
             "Ø pro Tag (simuliert)": f"{sim_meoh_day:,.2f} t/d",
-            "Pro Jahr (simuliert)": f"{sim_meoh_year:,.0f} t/a"
+            "Pro Jahr (simuliert)": f"{sim_meoh_year:,.0f} t/a",
         },
         {
             "Stoff / Energieform": "Wasserstoff (H₂)",
             "Rolle im Prozess": "Edukt (Elektrolyse → Synthese)",
             "Je t Methanol": f"{h2_per_t_meoh:.3f} t ({h2_per_t_meoh*1000:.1f} kg)",
             "Ø pro Tag (simuliert)": f"{sim_h2_day:,.2f} t/d",
-            "Pro Jahr (simuliert)": f"{sim_h2_year:,.0f} t/a"
+            "Pro Jahr (simuliert)": f"{sim_h2_year:,.0f} t/a",
         },
         {
             "Stoff / Energieform": "Kohlenstoffdioxid (CO₂)",
             "Rolle im Prozess": "Edukt (Meerwasser-Abscheidung)",
             "Je t Methanol": f"{co2_per_t_meoh:.3f} t",
             "Ø pro Tag (simuliert)": f"{sim_meoh_day * co2_per_t_meoh:,.2f} t/d",
-            "Pro Jahr (simuliert)": f"{sim_meoh_year * co2_per_t_meoh:,.0f} t/a"
+            "Pro Jahr (simuliert)": f"{sim_meoh_year * co2_per_t_meoh:,.0f} t/a",
         },
         {
             "Stoff / Energieform": "Entmineralisiertes Wasser (H₂O)",
             "Rolle im Prozess": "Edukt (Elektrolyse-Speisewasser)",
             "Je t Methanol": f"{h2o_elec_per_t_meoh:.2f} t",
             "Ø pro Tag (simuliert)": f"{sim_meoh_day * h2o_elec_per_t_meoh:,.1f} t/d",
-            "Pro Jahr (simuliert)": f"{sim_meoh_year * h2o_elec_per_t_meoh:,.0f} t/a"
+            "Pro Jahr (simuliert)": f"{sim_meoh_year * h2o_elec_per_t_meoh:,.0f} t/a",
         },
         {
             "Stoff / Energieform": "Elektrische Energie (Elektrolyse)",
             "Rolle im Prozess": "Energie-Input (ca. 52 kWh/kg H₂)",
             "Je t Methanol": f"{el_mwh_per_t_meoh:.2f} MWh",
             "Ø pro Tag (simuliert)": f"{sim_el_mwh_day:,.1f} MWh/d",
-            "Pro Jahr (simuliert)": f"{sim_el_mwh_year / 1000.0:,.2f} GWh/a"
+            "Pro Jahr (simuliert)": f"{sim_el_mwh_year / 1000.0:,.2f} GWh/a",
         },
         {
             "Stoff / Energieform": "Sauerstoff (O₂)",
             "Rolle im Prozess": "Nebenprodukt (aus Elektrolyse)",
             "Je t Methanol": f"{o2_byprod_per_t_meoh:.2f} t",
             "Ø pro Tag (simuliert)": f"{sim_meoh_day * o2_byprod_per_t_meoh:,.1f} t/d",
-            "Pro Jahr (simuliert)": f"{sim_meoh_year * o2_byprod_per_t_meoh:,.0f} t/a"
+            "Pro Jahr (simuliert)": f"{sim_meoh_year * o2_byprod_per_t_meoh:,.0f} t/a",
         },
         {
             "Stoff / Energieform": "Reaktionswasser (H₂O)",
             "Rolle im Prozess": "Nebenprodukt (aus Synthese)",
             "Je t Methanol": f"{h2o_byprod_per_t_meoh:.2f} t",
             "Ø pro Tag (simuliert)": f"{sim_meoh_day * h2o_byprod_per_t_meoh:,.1f} t/d",
-            "Pro Jahr (simuliert)": f"{sim_meoh_year * h2o_byprod_per_t_meoh:,.0f} t/a"
-        }
+            "Pro Jahr (simuliert)": f"{sim_meoh_year * h2o_byprod_per_t_meoh:,.0f} t/a",
+        },
     ]
 
     df_stoich = pd.DataFrame(rows)
@@ -390,3 +478,4 @@ with tab_stoich:
         "kann nach Aufbereitung oft anteilig wieder in die Wasseraufbereitung/Elektrolyse zurückgeführt werden; "
         "der abgeschiedene Sauerstoff ($\\text{O}_2$) fällt an der Küste meist als Nebenprodukt an (ggf. industriell nutzbar)."
     )
+    
