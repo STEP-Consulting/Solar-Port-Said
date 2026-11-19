@@ -408,38 +408,7 @@ with tab_year:
     )
     st.plotly_chart(fig_m, use_container_width=True)
 
-    with st.expander("🔍 Diagnose: März-Tage & auffällige 0-Ertragstage in den PVGIS-Rohdaten"):
-        df_diag = df_raw_pvgis.copy()
-        df_diag["day"] = np.arange(8760) // 24
-        df_diag["pv_sim_mw"] = df_year_sim["pv_mw"].to_numpy()
-        df_diag["date_str"] = df_diag["dt"].dt.strftime("%Y-%m-%d")
-
-        daily_check = df_diag.groupby(["day", "date_str"], as_index=False).agg(
-            g_h_raw_sum=("G_h_raw", "sum"),
-            pv_sim_mwh=("pv_sim_mw", "sum"),
-        )
-        zero_days_all = daily_check[daily_check["pv_sim_mwh"] <= 1e-6]
-        march_days = daily_check[(daily_check["day"] >= 59) & (daily_check["day"] <= 89)]
-
-        st.write(f"Tage im gesamten Jahr mit `0` PV-Ertrag nach Bereinigung: **{len(zero_days_all)}**")
-        if len(zero_days_all) > 0:
-            st.dataframe(zero_days_all, use_container_width=True, hide_index=True)
-
-        st.write("Niedrigste PV-Tageserträge im März (Tage 59–89, 0-basiert):")
-        st.dataframe(march_days.nsmallest(7, "pv_sim_mwh"), use_container_width=True, hide_index=True)
-
-        chosen_day = st.selectbox(
-            "Einzelnen Tag (0-basiert) auf Stundenniveau prüfen:",
-            options=daily_check["day"].tolist(),
-            index=65,  # entspricht Tag 65 -> 6. März bei Standard-Jan->Dez
-            format_func=lambda d: f"Tag {d} ({daily_check.loc[daily_check['day'] == d, 'date_str'].iloc[0]})",
-        )
-        st.dataframe(
-            df_diag[df_diag["day"] == chosen_day][["time(UTC)", "G_h_raw", "pv_sim_mw"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
+   
 # ==============================================================================
 # TAB 3: STÖCHIOMETRISCHE STOFF- & ENERGIEBILANZ
 # ==============================================================================
